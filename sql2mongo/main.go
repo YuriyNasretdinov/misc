@@ -70,7 +70,17 @@ func main() {
 			blen := len(buf)
 
 			if blen > 3 {
-				s := fmt.Sprintf("%x", m.Sum(nil))[0:blen]
+				s := fmt.Sprintf("%x", m.Sum(nil))
+
+				for len(s) < blen {
+					newS := make([]byte, 2*len(s))
+					copy(newS[0:len(s)], []byte(s))
+					copy(newS[len(s):], []byte(s))
+					s = string(newS)
+				}
+
+				s = s[0:blen]
+
 				//fmt.Fprintf(os.Stderr, "%s => %s\n", buf, s)
 				rewritten[s] = string(buf)
 				orig[string(buf)] = s
@@ -84,7 +94,17 @@ func main() {
 			blen := len(buf)
 
 			if blen > 5 {
-				s := fmt.Sprintf("%d", m)[0:blen]
+				s := fmt.Sprintf("%d", m)
+
+				for len(s) < blen {
+					newS := make([]byte, 2*len(s))
+					copy(newS[0:len(s)], []byte(s))
+					copy(newS[len(s):], []byte(s))
+					s = string(newS)
+				}
+
+				s = s[0:blen]
+
 				//fmt.Fprintf(os.Stderr, "%s => %s\n", buf, s)
 				rewritten[s] = string(buf)
 				orig[string(buf)] = s
