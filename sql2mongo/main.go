@@ -3,18 +3,133 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net/http"
-	"net/url"
 	"os"
-	"strings"
-	"crypto/md5"
-	"math/rand"
-	"time"
 
-	"github.com/xwb1989/sqlparser"
+	"strconv"
+
+	"strings"
+
+	. "github.com/xwb1989/sqlparser"
+	"gopkg.in/mgo.v2/bson"
 )
+
+var comparisonOperatorMap = map[string]string{
+	AST_EQ: "$eq",
+	AST_LT: "$lt",
+	AST_GT: "$gt",
+	AST_LE: "$lte",
+	AST_GE: "$gte",
+	AST_NE: "$ne",
+	//AST_NSE      : "<=>",
+	AST_IN:     "$in",
+	AST_NOT_IN: "$nin",
+	//AST_LIKE     : "like",
+	//AST_NOT_LIKE : "not like",
+}
+
+func convertPlainExpr(val ValExpr) interface{} {
+	var res interface{}
+
+	switch r := val.(type) {
+	case NumVal:
+		var err error
+		res, err = strconv.Atoi(string(r))
+		if err != nil {
+			res, _ = strconv.ParseFloat(string(r), 64)
+		}
+	case StrVal:
+		res = string(r)
+	case ValTuple:
+		res = convertExpr(r)
+	case nil:
+		res = nil
+	default:
+		log.Fatalf("Value must be num or str, got %T", val)
+	}
+
+	return res
+}
+
+func col(e *ColName) string {
+	var res = string(e.Name)
+	if e.Qualifier != nil {
+		res = string(e.Qualifier) + "." + res
+	}
+	return res
+}
+
+func convertExpr(rawE Expr) interface{} {
+	ret := make(bson.M)
+
+	switch e := rawE.(type) {
+	case *AndExpr:
+		ret["$and"] = []interface{}{convertExpr(e.Left), convertExpr(e.Right)}
+	case *OrExpr:
+		ret["$or"] = []interface{}{convertExpr(e.Left), convertExpr(e.Right)}
+	case *NotExpr:
+		ret["$not"] = convertExpr(e.Expr)
+	case *ParenBoolExpr:
+		return convertExpr(e.Expr)
+	case *ComparisonExpr:
+		k, ok := comparisonOperatorMap[e.Operator]
+		if !ok {
+			log.Fatalf("Operator %s cannot be mapped to mongodb query", e.Operator)
+		}
+
+		ret[col(e.Left.(*ColName))] = bson.M{k: convertPlainExpr(e.Right)}
+	case *RangeCond:
+		var f = col(e.Left.(*ColName))
+
+		ret["$and"] = []interface{}{
+			bson.M{f: bson.M{"$gte": convertPlainExpr(e.From)}},
+			bson.M{f: bson.M{"$lte": convertPlainExpr(e.To)}},
+		}
+
+		if e.Operator == AST_NOT_BETWEEN {
+			ret = bson.M{"$not": ret}
+		}
+	case *NullCheck:
+		what := "$eq"
+		if e.Operator == AST_IS_NOT_NULL {
+			what = "$neq"
+		}
+
+		ret[col(e.Expr.(*ColName))] = bson.M{what: nil}
+	case *ExistsExpr:
+		log.Fatal("EXISTS is not supported")
+	case NumVal:
+		return string(e)
+	case StrVal:
+		return string(e)
+	case ValArg:
+		log.Fatal("Binding of arguments is not supported")
+	case *NullVal:
+		return nil
+	case *ColName:
+		return col(e)
+	case ValTuple:
+		var res = make([]interface{}, 0, len(e))
+		for _, el := range e {
+			res = append(res, convertExpr(el))
+		}
+		return res
+	case *Subquery:
+		log.Fatal("Subqueries are not supported")
+	case ListArg:
+		log.Fatal("List args are not supported")
+	case *BinaryExpr:
+		log.Fatalf("Binary expressions, including '%c' are not supported", e.Operator)
+	case *UnaryExpr:
+		log.Fatalf("Unary expressions, including '%c' are not supported", e.Operator)
+	case *FuncExpr:
+		log.Fatalf("Func expressions, including '%s' are not supported", e.Name)
+	case *CaseExpr:
+		log.Fatal("Case expressions are not supported")
+	}
+
+	return ret
+}
 
 func main() {
 	if len(os.Args) != 2 {
@@ -23,143 +138,47 @@ func main() {
 
 	query := os.Args[1]
 
-	query = strings.Replace(query, ".", "___", -1)
-
-	rawRes, err := sqlparser.Parse(query)
+	res_, err := Parse(query)
 	if err != nil {
 		log.Fatalf("Could not parse sql: %s", err.Error())
 	}
 
-	res := rawRes.(*sqlparser.Select)
+	res := res_.(*Select)
 
-	buf := sqlparser.NewTrackedBuffer(nil)
-	rewritten := make(map[string]string)
-	orig := make(map[string]string)
+	//pretty.Log(res)
+	//fmt.Fprint(os.Stderr, "\n\n")
 
-	var i = 0
+	var mongoQuery = convertExpr(res.Where.Expr)
+	var collectionName string
 
-	rand.Seed(time.Now().UnixNano())
-
-	var seed = make([]byte, 20)
-	rand.Read(seed)
-
-	Rewrite(res, func(what interface{}) []byte {
-		switch buf := what.(type) {
-		case []byte:
-			str := strings.ToLower(string(buf))
-			if sqlparser.Aggregates[str] {
-				return buf
-			}
-
-			if res, ok := orig[string(buf)]; ok {
-				return []byte(res)
-			}
-
-			i++
-			identifier := fmt.Sprintf("ident%05d", i)
-			// fmt.Fprintf(os.Stderr, "%s => %s\n", buf, identifier)
-			rewritten[identifier] = string(buf)
-			orig[string(buf)] = identifier
-			return []byte(identifier)
-		case sqlparser.StrVal:
-			i++
-			m := md5.New()
-			m.Write(seed)
-			m.Write([]byte(buf))
-
-			blen := len(buf)
-
-			if blen > 3 {
-				s := fmt.Sprintf("%x", m.Sum(nil))
-
-				for len(s) < blen {
-					newS := make([]byte, 2*len(s))
-					copy(newS[0:len(s)], []byte(s))
-					copy(newS[len(s):], []byte(s))
-					s = string(newS)
-				}
-
-				s = s[0:blen]
-
-				//fmt.Fprintf(os.Stderr, "%s => %s\n", buf, s)
-				rewritten[s] = string(buf)
-				orig[string(buf)] = s
-				return []byte(s)
-			}
-
-			return []byte(buf)
-		case sqlparser.NumVal:
-			i++
-			m := rand.Int63()
-			blen := len(buf)
-
-			if blen > 5 {
-				s := fmt.Sprintf("%d", m)
-
-				for len(s) < blen {
-					newS := make([]byte, 2*len(s))
-					copy(newS[0:len(s)], []byte(s))
-					copy(newS[len(s):], []byte(s))
-					s = string(newS)
-				}
-
-				s = s[0:blen]
-
-				//fmt.Fprintf(os.Stderr, "%s => %s\n", buf, s)
-				rewritten[s] = string(buf)
-				orig[string(buf)] = s
-				return []byte(s)
-			}
-
-			return []byte(buf)
-		default:
-			log.Printf("Unrecognized type: %T", what)
-			panic("See errors above")
-		}
-	})
-
-	res.Format(buf)
-	query = buf.String()
-	fmt.Fprintf(os.Stderr, "Formatted: %s\n", query)
-
-	resp, err := http.PostForm(
-		"http://www.querymongo.com/",
-		url.Values{"MySQLQuery": []string{query}},
-	)
-
-	if err != nil {
-		log.Fatalf("Could not make request: %v", err.Error())
+	if len(res.From) > 1 {
+		log.Fatalf("Can only select from a single table at the moment (provided %d)", len(res.From))
 	}
 
-	contents, err := ioutil.ReadAll(resp.Body)
+	collectionName = string(res.From[0].(*AliasedTableExpr).Expr.(*TableName).Name)
+
+	out, err := bson.MarshalJSON(mongoQuery)
 	if err != nil {
-		log.Fatalf("Could not read request: %v", err.Error())
+		log.Fatalf("Could not marshal json: %s", err.Error())
 	}
 
-	parts := bytes.Split(contents, []byte(`<textarea id="mongoQuery" name="mongoQuery">`))
-	if len(parts) == 1 {
-		parts = bytes.Split(contents, []byte(`<div class="alert alert-error error">`))
-		if len(parts) == 2 {
-			parts = bytes.Split(parts[1], []byte(`</div>`))
-			log.Fatal(strings.TrimSpace(string(parts[0])))
+	parts := []string{
+		"db",
+		collectionName,
+		fmt.Sprintf("find(%s)", bytes.TrimSpace(out)),
+	}
+
+	if res.Limit != nil {
+		rowC, _ := convertPlainExpr(res.Limit.Rowcount).(int)
+		if rowC > 0 {
+			parts = append(parts, fmt.Sprintf("limit(%d)", rowC))
 		}
 
-		log.Fatal("Could not parse format, missing textarea")
+		skip, _ := convertPlainExpr(res.Limit.Offset).(int)
+		if skip > 0 {
+			parts = append(parts, fmt.Sprintf("skip(%d)", skip))
+		}
 	}
 
-	parts = bytes.Split(parts[1], []byte(`</textarea>`))
-
-	if len(parts) == 1 {
-		log.Fatal("Could not parse format, missing closing tag for textarea")
-	}
-
-	result := parts[0]
-
-	for old, new := range rewritten {
-		result = bytes.Replace(result, []byte(old), []byte(new), -1)
-	}
-
-	result = bytes.Replace(result, []byte("___"), []byte("."), -1)
-
-	fmt.Printf("%s\n", result)
+	fmt.Printf("%s", strings.Join(parts, "."))
 }
