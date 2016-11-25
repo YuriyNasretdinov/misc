@@ -56,7 +56,7 @@ func col(e *ColName) string {
 	if e.Qualifier != nil {
 		res = string(e.Qualifier) + "." + res
 	}
-	return res
+	return strings.Replace(res, "__", ".", -1)
 }
 
 func convertExpr(rawE Expr) interface{} {
@@ -131,6 +131,14 @@ func convertExpr(rawE Expr) interface{} {
 	return ret
 }
 
+func formatJSON(in interface{}) string {
+	out, err := bson.MarshalJSON(in)
+	if err != nil {
+		log.Fatalf("Could not marshal json: %s", err.Error())
+	}
+	return string(bytes.TrimSpace(out))
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		log.Fatalf("Usage: %s '<query>'", os.Args[0])
@@ -148,7 +156,10 @@ func main() {
 	//pretty.Log(res)
 	//fmt.Fprint(os.Stderr, "\n\n")
 
-	var mongoQuery = convertExpr(res.Where.Expr)
+	var mongoQuery interface{}
+	if res.Where != nil {
+		mongoQuery = convertExpr(res.Where.Expr)
+	}
 	var collectionName string
 
 	if len(res.From) > 1 {
@@ -157,15 +168,78 @@ func main() {
 
 	collectionName = string(res.From[0].(*AliasedTableExpr).Expr.(*TableName).Name)
 
-	out, err := bson.MarshalJSON(mongoQuery)
-	if err != nil {
-		log.Fatalf("Could not marshal json: %s", err.Error())
+	method := "find"
+	projectionMap := make(bson.M)
+
+	for _, expr := range res.SelectExprs {
+		switch e := expr.(type) {
+		case *StarExpr:
+			if len(res.SelectExprs) == 1 && e.TableName == nil {
+				break
+			}
+
+			log.Fatalf("Star expressions other than '*' (%s) are not supported at the moment", e)
+		case *NonStarExpr:
+			if e.As != nil {
+				log.Fatalf("AS (%s) is not supported at the moment in select queries", e)
+			}
+
+			switch f:= e.Expr.(type) {
+			case *ColName:
+				projectionMap[col(f)] = true
+			case *FuncExpr:
+				f.Name = bytes.ToLower(f.Name)
+
+				if !bytes.Equal(f.Name, []byte("count")) {
+					log.Fatalf("Unsupported function is SELECT fields: %s, only count is supported", f.Name)
+				}
+
+				if len(res.SelectExprs) != 1 {
+					log.Fatal("'count' must be the only function is SELECT fields at the moment")
+				}
+
+				if len(f.Exprs) != 1 {
+					log.Fatal("'count' must have only a single argument")
+				}
+
+				if f.Distinct {
+					log.Fatal("'count(distinct ...)' is not supported")
+				}
+
+				switch fe := f.Exprs[0].(type) {
+				case *StarExpr:
+				case *NonStarExpr:
+					st, ok := fe.Expr.(*ColName)
+					if !ok {
+						log.Fatal("Only count(*) and count(colname) are supported")
+					}
+
+					mongoQuery = bson.M{
+						"$and": []interface{}{
+							bson.M{col(st): bson.M{"$exists": true}},
+							mongoQuery,
+						},
+					}
+				}
+
+				method = "count"
+			default:
+				log.Fatalf("Supported %T in SELECT fields", f)
+			}
+		default:
+			log.Fatalf("Internal inconsistency, got type %T", e)
+		}
+	}
+
+	projectionArg := ""
+	if len(projectionMap) > 0 {
+		projectionArg = ", " + formatJSON(projectionMap)
 	}
 
 	parts := []string{
 		"db",
 		collectionName,
-		fmt.Sprintf("find(%s)", bytes.TrimSpace(out)),
+		fmt.Sprintf("%s(%s%s)", method, formatJSON(mongoQuery), projectionArg),
 	}
 
 	if res.Limit != nil {
