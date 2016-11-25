@@ -233,6 +233,9 @@ func main() {
 
 	projectionArg := ""
 	if len(projectionMap) > 0 {
+		if _, ok := projectionMap["_id"]; !ok {
+			projectionMap["_id"] = false
+		}
 		projectionArg = ", " + formatJSON(projectionMap)
 	}
 
@@ -240,6 +243,29 @@ func main() {
 		"db",
 		collectionName,
 		fmt.Sprintf("%s(%s%s)", method, formatJSON(mongoQuery), projectionArg),
+	}
+
+	if method == "count" {
+		if res.Limit != nil {
+			log.Print("Limit clause is ignored for count")
+			res.Limit = nil
+		}
+	}
+
+	if res.OrderBy != nil && len(res.OrderBy) > 0 {
+		sortMap := make(map[string]int)
+
+		for _, o := range res.OrderBy {
+			colName := col(o.Expr.(*ColName))
+
+			if o.Direction == AST_ASC {
+				sortMap[colName] = 1
+			} else {
+				sortMap[colName] = -1
+			}
+		}
+
+		parts = append(parts, fmt.Sprintf("sort(%s)", formatJSON(sortMap)))
 	}
 
 	if res.Limit != nil {
@@ -252,6 +278,10 @@ func main() {
 		if skip > 0 {
 			parts = append(parts, fmt.Sprintf("skip(%d)", skip))
 		}
+	}
+
+	if res.GroupBy != nil {
+		log.Fatal("Group by is not supported yet. Subsribe to our channel for updates!")
 	}
 
 	fmt.Printf("%s", strings.Join(parts, "."))
